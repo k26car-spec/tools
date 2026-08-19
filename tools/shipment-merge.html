@@ -244,6 +244,11 @@ function stripTw(s) {
   return s.startsWith('TW') ? s.slice(2) : s;
 }
 
+function formatSize(s) {
+  // 半號用結尾減號表示（例：4-），轉成小數點五。例：4- -> 4.5
+  return s.endsWith('-') ? s.slice(0, -1) + '.5' : s;
+}
+
 function companyName(handwrittenNo, prefix) {
   const parts = handwrittenNo.split('-');
   const store = parts[parts.length - 1];
@@ -381,14 +386,14 @@ function buildMerge(orderData, shipData, storeCodeMap, deliveryDate, companyPref
     const pickslip = pickslipMap[store];
     const company = companyName(store, companyPrefix);
     return {
-      'Converse Order No.': idTransform(toStr(r['单号'])),
+      'Converse Order No.': '',
       'Pickslipno': pickslip,
       'Orderkey': orderkeyMap[store],
       'Deliverydate': deliveryDate,
       'Company': company,
       'Material ID': stripTw(huohao),
       'Sku': stripTw(huohao),
-      'Size': toStr(r['尺码']),
+      'Size': formatSize(toStr(r['尺码'])),
       'Shippedqty': toNum(r['订单数量']),
       'Consigneekey': storeCodeMap[company],
       'Descr': toStr(r['货品简称']),
@@ -420,13 +425,13 @@ function buildMerge(orderData, shipData, storeCodeMap, deliveryDate, companyPref
 
   // 重複 ID 提示
   const idSet = new Set(finalRows.map(function (r) {
-    return [r['Converse Order No.'], r['Pickslipno'], r['Orderkey']].join('::');
+    return [r['Pickslipno'], r['Orderkey']].join('::');
   }));
   const companySet = new Set(finalRows.map(function (r) { return r['Company']; }));
   let idWarning = null;
   if (idSet.size < companySet.size) {
     idWarning = '注意：' + companySet.size + ' 家店，但只產生了 ' + idSet.size +
-      ' 組不重複的 Converse Order No. / Pickslipno / Orderkey / 總單號' +
+      ' 組不重複的 Pickslipno / Orderkey / 總單號' +
       '（不同店家的單號結尾被規則裁掉、共用同一組值了——這是已確認接受的行為，這幾欄只剩 Company 能區分店家）。';
   }
 
