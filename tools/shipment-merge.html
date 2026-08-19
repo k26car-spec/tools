@@ -256,17 +256,16 @@ function companyName(handwrittenNo, prefix) {
 }
 
 function normalizeStoreKey(handwrittenNo, prefix) {
-  // 訂單報表跟出入庫明細表的店名寫法不一定一致：有些出入庫明細表會把經銷商簡稱
-  // 直接黏在店名前面、中間沒有減號（例：70X-福城京站台北），訂單報表則沒有黏
-  // （70X-京站台北）。這裡把黏住的經銷商簡稱去掉，讓兩份報表可以用同一個 key 比對。
-  const idx = handwrittenNo.lastIndexOf('-');
-  if (idx === -1) {
-    return handwrittenNo.startsWith(prefix) ? handwrittenNo.slice(prefix.length) : handwrittenNo;
+  // 訂單報表跟出入庫明細表的店名寫法不一定一致，經銷商簡稱有時會被額外塞進手工單號：
+  // - 直接黏在店名前面、中間沒有減號（例：70X-福城京站台北）
+  // - 用減號當獨立一段插在中間（例：70X-福城-台中LaLaPort）
+  // 訂單報表通常沒有這段（70X-京站台北）。這裡把這些額外插入/黏住的經銷商簡稱都去掉，
+  // 讓兩份報表可以用同一個 key 比對。
+  const parts = handwrittenNo.split('-').filter(function (p) { return p !== prefix; });
+  if (parts.length && parts[parts.length - 1].startsWith(prefix)) {
+    parts[parts.length - 1] = parts[parts.length - 1].slice(prefix.length);
   }
-  const batch = handwrittenNo.slice(0, idx);
-  let store = handwrittenNo.slice(idx + 1);
-  if (store.startsWith(prefix)) store = store.slice(prefix.length);
-  return batch + '-' + store;
+  return parts.join('-');
 }
 
 function buildStoreCodeMap(storeCodeRows) {
