@@ -205,12 +205,8 @@ const FINAL_COLS = [
   'Material ID', 'Sku', 'Size', 'Shippedqty', 'Consigneekey', 'Descr', '總單號',
 ];
 
-const REQUIRED_ORDER_COLS = ['单号', '手工单号', '货号', '尺码', '订单数量', '货品简称'];
+const REQUIRED_ORDER_COLS = ['单号', '手工单号', '货号', '尺码', '订单数量', '客户代码', '货品简称'];
 const REQUIRED_SHIP_COLS = ['出货手工单号', '销售出货单号', '销售出/入库单号', '货号', '出货数量'];
-
-// 店點名稱 -> 匡威舊店編-10碼，用來查 Consigneekey（2026-08-19 起改用店編對照表，取代客户代码補0的舊規則）
-// 對照表來源：references/匡威-寶原店編對照表.xlsx，更新時要跟 Python 版 scripts/merge_to_jinghong.py 一起同步
-const STORE_CODE_MAP = {"福城-京站台北":"0000116208","福城-台中LaLaPort":"0000141922","福城-南港LaLaPort":"0000143566","尚智-太八專賣店":"0000116735","尚智-武昌五店":"0000127067","尚智-華泰":"0000134323","尚亨-新光三越台南西門一館":"0000144846","尚亨-大江購物中壢":"0000144848","尚亨-中和環球":"0000144839","尚亨-義享時尚廣場":"0000144774","尚亨-桃園統領":"0000145011","尚亨-漢神洲際":"0000145195","微笑-嘉義中山六專賣店":"0000116887","微笑-遠東台中":"0000116827","微笑-中友台中":"0000116881","ABC-MART GS 信義微風2號店":"0000145155","ABC-MART GS 漢中2店":"0000115998","摩曼頓-大東一店":"0000116590","摩曼頓-新光三越南西三館":"0000116424","摩曼頓-新光三越嘉義":"0000116525","摩曼頓-新光三越桃園站前":"0000116485","摩曼頓-美麗華":"0000116459","摩曼頓-中港":"0000144458","摩曼頓-板橋府中店":"0000116498","摩曼頓-蘆洲三民店":"0000116507","摩曼頓-蘆洲長榮店":"0000116509","摩曼頓-宜蘭新月":"0000116477","摩曼頓-台茂店":"0000116560","摩曼頓-花蓮中正":"0000142372","摩曼頓-新光三越台北信義A11":"0000116433","摩曼頓-新光三越台中":"0000116434","摩曼頓-淡水中山店":"0000116562","摩曼頓-台南北門六":"0000126001","摩曼頓-SOGO台北忠孝":"0000126227","摩曼頓-三井林口":"0000126573","摩曼頓-夢時代高雄":"0000116983","摩曼頓-漢神高雄巨蛋":"0000117046","摩曼頓-新竹遠東巨城Rookie":"0000137571","摩曼頓-太平九":"0000116441","摩曼頓-Diamond Tower":"0000141920","摩曼頓-NBA STORE":"0000135896","摩曼頓-SKM PARK CONVERSE":"0000144060","摩曼頓-街邊店總倉":"0000127285","摩曼頓-YAHOO旗艦店":"0000134758"};
 
 function toStr(v) {
   if (v === null || v === undefined) return '';
@@ -354,40 +350,36 @@ function buildMerge(orderData, shipData, deliveryDate, companyPrefix) {
     throw err;
   }
 
-  // Pickslipno 對照表
+  // Pickslipno / Orderkey 對照表
   const pickslipMap = {};
+  const orderkeyMap = {};
   storeMapList.forEach(function (r) {
     const store = toStr(r['出货手工单号']);
     pickslipMap[store] = idTransform(toStr(r['销售出货单号']));
+    orderkeyMap[store] = idTransform(toStr(r['销售出/入库单号']));
   });
 
   const finalRows = df2f.map(function (r) {
     const store = toStr(r['手工单号']);
     const huohao = toStr(r['货号']);
     const pickslip = pickslipMap[store];
-    const company = companyName(store, companyPrefix);
     return {
       'Converse Order No.': idTransform(toStr(r['单号'])),
       'Pickslipno': pickslip,
-      'Orderkey': '',
+      'Orderkey': orderkeyMap[store],
       'Deliverydate': deliveryDate,
-      'Company': company,
+      'Company': companyName(store, companyPrefix),
       'Material ID': stripTw(huohao),
       'Sku': stripTw(huohao),
       'Size': toStr(r['尺码']),
       'Shippedqty': toNum(r['订单数量']),
-      'Consigneekey': STORE_CODE_MAP[company],
+      'Consigneekey': toStr(r['客户代码']).padStart(10, '0'),
       'Descr': toStr(r['货品简称']),
       '總單號': pickslip,
       __store: store,
       __huohao: huohao,
     };
   });
-
-  const missingStores = Array.from(new Set(finalRows.filter(function (r) { return !r['Consigneekey']; }).map(function (r) { return r['Company']; })));
-  if (missingStores.length) {
-    throw new Error('以下店點在「匡威-寶原店編對照表」裡找不到對應的店編，本次先不產出檔案：\n' + missingStores.join('\n'));
-  }
 
   // 排序：手工单号 依出現順序、貨號 字典順序
   const distinctStoreOrder = [];
@@ -406,13 +398,13 @@ function buildMerge(orderData, shipData, deliveryDate, companyPrefix) {
 
   // 重複 ID 提示
   const idSet = new Set(finalRows.map(function (r) {
-    return [r['Converse Order No.'], r['Pickslipno']].join('::');
+    return [r['Converse Order No.'], r['Pickslipno'], r['Orderkey']].join('::');
   }));
   const companySet = new Set(finalRows.map(function (r) { return r['Company']; }));
   let idWarning = null;
   if (idSet.size < companySet.size) {
     idWarning = '注意：' + companySet.size + ' 家店，但只產生了 ' + idSet.size +
-      ' 組不重複的 Converse Order No. / Pickslipno / 總單號' +
+      ' 組不重複的 Converse Order No. / Pickslipno / Orderkey / 總單號' +
       '（不同店家的單號結尾被規則裁掉、共用同一組值了——這是已確認接受的行為，這幾欄只剩 Company 能區分店家）。';
   }
 
