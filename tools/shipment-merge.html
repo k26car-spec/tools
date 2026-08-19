@@ -371,20 +371,22 @@ function buildMerge(orderData, shipData, storeCodeMap, deliveryDate, companyPref
     throw err;
   }
 
-  // Pickslipno / Orderkey 對照表
+  // Pickslipno / Orderkey / Company 對照表
   const pickslipMap = {};
   const orderkeyMap = {};
+  const companyMap = {};
   storeMapList.forEach(function (r) {
     const store = toStr(r['出货手工单号']);
     pickslipMap[store] = idTransform(toStr(r['销售出货单号']));
     orderkeyMap[store] = idTransform(toStr(r['销售出/入库单号']));
+    companyMap[store] = companyName(store, companyPrefix);
   });
 
   const finalRows = df2f.map(function (r) {
     const store = toStr(r['手工单号']);
     const huohao = toStr(r['货号']);
     const pickslip = pickslipMap[store];
-    const company = companyName(store, companyPrefix);
+    const company = companyMap[store];
     return {
       'Converse Order No.': '',
       'Pickslipno': pickslip,
