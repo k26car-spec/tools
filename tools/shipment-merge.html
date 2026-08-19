@@ -116,19 +116,24 @@
 <body>
 <div class="container">
   <h1>福城出貨 → 京虹格式合併工具</h1>
-  <div class="subtitle">把「銷售訂單分析報表」+「銷售出入庫明細表」合併成京虹固定格式的出貨明細，全部在瀏覽器裡處理，資料不會上傳到任何地方。</div>
+  <div class="subtitle">把「銷售訂單分析報表」+「銷售出入庫明細表」+「匡威-寶原店編對照表」合併成京虹固定格式的出貨明細，全部在瀏覽器裡處理，資料不會上傳到任何地方。</div>
 
   <div class="card">
-    <h2>1. 上傳兩份福城報表</h2>
+    <h2>1. 上傳三份檔案</h2>
     <div class="field">
       <label>銷售訂單分析報表（.xlsx）</label>
       <input type="file" id="orderFile" accept=".xlsx,.xls">
-      <div class="hint">尺碼級明細，含单号、手工单号、货号、尺码、订单数量、客户代码、货品简称</div>
+      <div class="hint">尺碼級明細，含单号、手工单号、货号、尺码、订单数量、货品简称</div>
     </div>
     <div class="field">
       <label>銷售出入庫明細表（.xlsx）</label>
       <input type="file" id="shipFile" accept=".xlsx,.xls">
       <div class="hint">貨號級實際出貨量，含出货手工单号、销售出货单号、销售出/入库单号、货号、出货数量</div>
+    </div>
+    <div class="field">
+      <label>匡威-寶原店編對照表（.xlsx）</label>
+      <input type="file" id="storeCodeFile" accept=".xlsx,.xls">
+      <div class="hint">含店點名稱、匡威舊店編-10碼，用來查 Consigneekey</div>
     </div>
   </div>
 
@@ -205,8 +210,9 @@ const FINAL_COLS = [
   'Material ID', 'Sku', 'Size', 'Shippedqty', 'Consigneekey', 'Descr', '總單號',
 ];
 
-const REQUIRED_ORDER_COLS = ['单号', '手工单号', '货号', '尺码', '订单数量', '客户代码', '货品简称'];
+const REQUIRED_ORDER_COLS = ['单号', '手工单号', '货号', '尺码', '订单数量', '货品简称'];
 const REQUIRED_SHIP_COLS = ['出货手工单号', '销售出货单号', '销售出/入库单号', '货号', '出货数量'];
+const REQUIRED_STORE_CODE_COLS = ['店點名稱', '匡威舊店編-10碼'];
 
 function toStr(v) {
   if (v === null || v === undefined) return '';
@@ -242,6 +248,16 @@ function companyName(handwrittenNo, prefix) {
   const parts = handwrittenNo.split('-');
   const store = parts[parts.length - 1];
   return prefix + '-' + store;
+}
+
+function buildStoreCodeMap(storeCodeRows) {
+  const map = {};
+  storeCodeRows.forEach(function (r) {
+    const name = toStr(r['店點名稱']).trim();
+    const code = toStr(r['匡威舊店編-10碼']).trim();
+    if (name && code) map[name] = code.padStart(10, '0');
+  });
+  return map;
 }
 
 async function sheetToObjects(file) {
@@ -286,7 +302,7 @@ function checkRequiredCols(headers, required, sheetLabel) {
   }
 }
 
-function buildMerge(orderData, shipData, deliveryDate, companyPrefix) {
+function buildMerge(orderData, shipData, storeCodeMap, deliveryDate, companyPrefix) {
   const df2 = orderData.rows;
   const df3All = shipData.rows;
   const df3 = df3All.filter(function (r) { return toStr(r['货号']) !== ''; });
@@ -363,23 +379,29 @@ function buildMerge(orderData, shipData, deliveryDate, companyPrefix) {
     const store = toStr(r['手工单号']);
     const huohao = toStr(r['货号']);
     const pickslip = pickslipMap[store];
+    const company = companyName(store, companyPrefix);
     return {
       'Converse Order No.': idTransform(toStr(r['单号'])),
       'Pickslipno': pickslip,
       'Orderkey': orderkeyMap[store],
       'Deliverydate': deliveryDate,
-      'Company': companyName(store, companyPrefix),
+      'Company': company,
       'Material ID': stripTw(huohao),
       'Sku': stripTw(huohao),
       'Size': toStr(r['尺码']),
       'Shippedqty': toNum(r['订单数量']),
-      'Consigneekey': toStr(r['客户代码']).padStart(10, '0'),
+      'Consigneekey': storeCodeMap[company],
       'Descr': toStr(r['货品简称']),
       '總單號': pickslip,
       __store: store,
       __huohao: huohao,
     };
   });
+
+  const missingStores = Array.from(new Set(finalRows.filter(function (r) { return !r['Consigneekey']; }).map(function (r) { return r['Company']; })));
+  if (missingStores.length) {
+    throw new Error('以下店點在「匡威-寶原店編對照表」裡找不到對應的店編，本次先不產出檔案：\n' + missingStores.join('\n'));
+  }
 
   // 排序：手工单号 依出現順序、貨號 字典順序
   const distinctStoreOrder = [];
@@ -505,11 +527,12 @@ async function run() {
 
   const orderInput = document.getElementById('orderFile');
   const shipInput = document.getElementById('shipFile');
+  const storeCodeInput = document.getElementById('storeCodeFile');
   const dateInput = document.getElementById('deliveryDate');
   const prefixInput = document.getElementById('companyPrefix');
 
-  if (!orderInput.files[0] || !shipInput.files[0]) {
-    resultArea.appendChild(el('div', { class: 'result-box err', text: '請先選擇兩份報表檔案。' }));
+  if (!orderInput.files[0] || !shipInput.files[0] || !storeCodeInput.files[0]) {
+    resultArea.appendChild(el('div', { class: 'result-box err', text: '請先選擇三份檔案。' }));
     return;
   }
   if (!dateInput.value) {
@@ -523,16 +546,19 @@ async function run() {
   try {
     const orderData = await sheetToObjects(orderInput.files[0]);
     const shipData = await sheetToObjects(shipInput.files[0]);
+    const storeCodeData = await sheetToObjects(storeCodeInput.files[0]);
 
     checkRequiredCols(orderData.headers, REQUIRED_ORDER_COLS, '銷售訂單分析報表');
     checkRequiredCols(shipData.headers, REQUIRED_SHIP_COLS, '銷售出入庫明細表');
+    checkRequiredCols(storeCodeData.headers, REQUIRED_STORE_CODE_COLS, '匡威-寶原店編對照表');
+    const storeCodeMap = buildStoreCodeMap(storeCodeData.rows);
 
     const deliveryDateStr = dateInput.value;
     const [dy, dm, dd] = deliveryDateStr.split('-').map(Number);
     const deliveryDate = new Date(Date.UTC(dy, dm - 1, dd));
     const companyPrefix = (prefixInput.value || '福城').trim();
 
-    const merged = buildMerge(orderData, shipData, deliveryDate, companyPrefix);
+    const merged = buildMerge(orderData, shipData, storeCodeMap, deliveryDate, companyPrefix);
 
     if (merged.excludedStores.length) {
       resultArea.appendChild(el('div', {
