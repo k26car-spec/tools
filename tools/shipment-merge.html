@@ -255,6 +255,20 @@ function companyName(handwrittenNo, prefix) {
   return prefix + '-' + store;
 }
 
+function normalizeStoreKey(handwrittenNo, prefix) {
+  // 訂單報表跟出入庫明細表的店名寫法不一定一致：有些出入庫明細表會把經銷商簡稱
+  // 直接黏在店名前面、中間沒有減號（例：70X-福城京站台北），訂單報表則沒有黏
+  // （70X-京站台北）。這裡把黏住的經銷商簡稱去掉，讓兩份報表可以用同一個 key 比對。
+  const idx = handwrittenNo.lastIndexOf('-');
+  if (idx === -1) {
+    return handwrittenNo.startsWith(prefix) ? handwrittenNo.slice(prefix.length) : handwrittenNo;
+  }
+  const batch = handwrittenNo.slice(0, idx);
+  let store = handwrittenNo.slice(idx + 1);
+  if (store.startsWith(prefix)) store = store.slice(prefix.length);
+  return batch + '-' + store;
+}
+
 function buildStoreCodeMap(storeCodeRows) {
   const map = {};
   storeCodeRows.forEach(function (r) {
@@ -312,21 +326,22 @@ function buildMerge(orderData, shipData, storeCodeMap, deliveryDate, companyPref
   const df3All = shipData.rows;
   const df3 = df3All.filter(function (r) { return toStr(r['货号']) !== ''; });
 
-  // 建立 store_map：出货手工单号 / 销售出货单号 / 销售出/入库单号 唯一組合，保留出現順序
+  // 建立 store_map：出货手工单号（正規化）/ 销售出货单号 / 销售出/入库单号 唯一組合，保留出現順序
   const tripleSeen = new Set();
   const storeMapList = [];
   df3.forEach(function (r) {
-    const key = [r['出货手工单号'], r['销售出货单号'], r['销售出/入库单号']].map(toStr).join('::');
+    const storeKey = normalizeStoreKey(toStr(r['出货手工单号']), companyPrefix);
+    const key = [storeKey, r['销售出货单号'], r['销售出/入库单号']].map(toStr).join('::');
     if (!tripleSeen.has(key)) {
       tripleSeen.add(key);
-      storeMapList.push(r);
+      storeMapList.push(Object.assign({}, r, { __storeKey: storeKey }));
     }
   });
-  const storeOrder = storeMapList.map(function (r) { return toStr(r['出货手工单号']); });
+  const storeOrder = storeMapList.map(function (r) { return r.__storeKey; });
   const storeOrderSet = new Set(storeOrder);
 
   // 排除：訂單報表有、但出入庫明細表沒有出貨紀錄的店
-  const df2StoreSet = new Set(df2.map(function (r) { return toStr(r['手工单号']); }));
+  const df2StoreSet = new Set(df2.map(function (r) { return normalizeStoreKey(toStr(r['手工单号']), companyPrefix); }));
   const excludedStores = Array.from(df2StoreSet).filter(function (s) { return !storeOrderSet.has(s); }).sort();
 
   // 訂單報表去重：同一手工單號會有兩組单号(如 -001/-004)，除了单号本身完全重複
@@ -337,22 +352,22 @@ function buildMerge(orderData, shipData, storeCodeMap, deliveryDate, companyPref
     const key = dedupHeaders.map(function (h) { return toStr(r[h]); }).join('::');
     if (!seenRow.has(key)) {
       seenRow.add(key);
-      df2Dedup.push(r);
+      df2Dedup.push(Object.assign({}, r, { __storeKey: normalizeStoreKey(toStr(r['手工单号']), companyPrefix) }));
     }
   });
 
   // 只保留已出貨的店
-  const df2f = df2Dedup.filter(function (r) { return storeOrderSet.has(toStr(r['手工单号'])); });
+  const df2f = df2Dedup.filter(function (r) { return storeOrderSet.has(r.__storeKey); });
 
   // 資料完整性檢查：去重後的訂購量，逐店逐貨號要跟出入庫明細表的出貨量對得起來
   const chkOrder = new Map();
   df2f.forEach(function (r) {
-    const key = toStr(r['手工单号']) + '::' + toStr(r['货号']);
+    const key = r.__storeKey + '::' + toStr(r['货号']);
     chkOrder.set(key, (chkOrder.get(key) || 0) + toNum(r['订单数量']));
   });
   const chkShip = new Map();
   df3.forEach(function (r) {
-    const key = toStr(r['出货手工单号']) + '::' + toStr(r['货号']);
+    const key = normalizeStoreKey(toStr(r['出货手工单号']), companyPrefix) + '::' + toStr(r['货号']);
     chkShip.set(key, (chkShip.get(key) || 0) + toNum(r['出货数量']));
   });
   const allKeys = new Set([].concat(Array.from(chkOrder.keys()), Array.from(chkShip.keys())));
@@ -376,14 +391,14 @@ function buildMerge(orderData, shipData, storeCodeMap, deliveryDate, companyPref
   const orderkeyMap = {};
   const companyMap = {};
   storeMapList.forEach(function (r) {
-    const store = toStr(r['出货手工单号']);
+    const store = r.__storeKey;
     pickslipMap[store] = idTransform(toStr(r['销售出货单号']));
     orderkeyMap[store] = idTransform(toStr(r['销售出/入库单号']));
     companyMap[store] = companyName(store, companyPrefix);
   });
 
   const finalRows = df2f.map(function (r) {
-    const store = toStr(r['手工单号']);
+    const store = r.__storeKey;
     const huohao = toStr(r['货号']);
     const pickslip = pickslipMap[store];
     const company = companyMap[store];
