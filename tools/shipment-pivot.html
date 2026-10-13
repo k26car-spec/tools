@@ -424,14 +424,8 @@ async function ensurePivotStyles(zip, parser, serializer) {
     : parser.parseFromString('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="' + ns + '"/>', 'application/xml');
   const root = doc.documentElement;
 
-  const numFmtsEl = getOrCreateStyleChild(doc, root, 'numFmts');
-  const existingIds = elementChildren(numFmtsEl).map(function (n) { return parseInt(n.getAttribute('numFmtId'), 10); }).filter(function (n) { return !Number.isNaN(n); });
-  const numFmtId = Math.max(163, existingIds.length ? Math.max.apply(null, existingIds) : 163) + 1;
-  const numFmtEl = doc.createElementNS(ns, 'numFmt');
-  numFmtEl.setAttribute('numFmtId', String(numFmtId));
-  numFmtEl.setAttribute('formatCode', '#,##0.##');
-  numFmtsEl.appendChild(numFmtEl);
-  numFmtsEl.setAttribute('count', String(elementChildren(numFmtsEl).length));
+  // 數字格式用 Excel 內建的 numFmtId（3="#,##0"、4="#,##0.00"），不用自訂格式碼，
+  // 避免像「#,##0.##」這種可省略小數位的寫法在 Google 試算表裡被解讀成帶多餘句點。
 
   const fontsEl = getOrCreateStyleChild(doc, root, 'fonts');
   const boldFontEl = doc.createElementNS(ns, 'font');
@@ -493,9 +487,11 @@ async function ensurePivotStyles(zip, parser, serializer) {
     header: makeXf({ fontId: fontBoldId, fillId: fillHeaderId, borderId: borderThinId }),
     group: makeXf({ fontId: fontBoldId, fillId: fillGroupId, borderId: borderThinId }),
     text: makeXf({ borderId: borderThinId }),
-    num: makeXf({ borderId: borderThinId, numFmtId: numFmtId, align: 'right' }),
+    numInt: makeXf({ borderId: borderThinId, numFmtId: 3, align: 'right' }),
+    numDec: makeXf({ borderId: borderThinId, numFmtId: 4, align: 'right' }),
     totalText: makeXf({ fontId: fontBoldId, fillId: fillTotalId, borderId: borderThinId }),
-    totalNum: makeXf({ fontId: fontBoldId, fillId: fillTotalId, borderId: borderThinId, numFmtId: numFmtId, align: 'right' }),
+    totalNumInt: makeXf({ fontId: fontBoldId, fillId: fillTotalId, borderId: borderThinId, numFmtId: 3, align: 'right' }),
+    totalNumDec: makeXf({ fontId: fontBoldId, fillId: fillTotalId, borderId: borderThinId, numFmtId: 4, align: 'right' }),
   };
 
   zip.file(path, serializer.serializeToString(doc));
@@ -503,16 +499,31 @@ async function ensurePivotStyles(zip, parser, serializer) {
 }
 
 function buildPivotSheetXml(pivotRows, styleIds) {
+  function numStyle(val, intStyle, decStyle) {
+    const rounded = Math.round(val * 100) / 100;
+    return Number.isInteger(rounded) ? intStyle : decStyle;
+  }
+
   const rows = [{
     cells: ['列標籤', '加總 - 出货数量', '加總 - 出货金额'],
     styles: [styleIds.header, styleIds.header, styleIds.header],
   }];
   pivotRows.forEach(function (r) {
-    let st;
-    if (r.kind === 'group') st = [styleIds.group, styleIds.group, styleIds.group];
-    else if (r.kind === 'total') st = [styleIds.totalText, styleIds.totalNum, styleIds.totalNum];
-    else st = [styleIds.text, styleIds.num, styleIds.num];
-    rows.push({ cells: [r.label, r.qty, r.amt], styles: st });
+    if (r.kind === 'group') {
+      rows.push({ cells: [r.label, r.qty, r.amt], styles: [styleIds.group, styleIds.group, styleIds.group] });
+      return;
+    }
+    const textStyle = r.kind === 'total' ? styleIds.totalText : styleIds.text;
+    const qtyStyle = r.kind === 'total'
+      ? numStyle(r.qty, styleIds.totalNumInt, styleIds.totalNumDec)
+      : numStyle(r.qty, styleIds.numInt, styleIds.numDec);
+    const amtStyle = r.kind === 'total'
+      ? numStyle(r.amt, styleIds.totalNumInt, styleIds.totalNumDec)
+      : numStyle(r.amt, styleIds.numInt, styleIds.numDec);
+    rows.push({
+      cells: [r.label, Math.round(r.qty * 100) / 100, Math.round(r.amt * 100) / 100],
+      styles: [textStyle, qtyStyle, amtStyle],
+    });
   });
 
   const rowsXml = rows.map(function (row, idx) {
@@ -539,6 +550,125 @@ function buildPivotSheetXml(pivotRows, styleIds) {
     '</worksheet>';
 }
 
+// 把一個相對路徑（相對某個資料夾）解析成 zip 裡的絕對路徑，處理 "../" 這種寫法。
+function resolveRelPath(baseDir, target) {
+  const parts = (baseDir + '/' + target).split('/');
+  const stack = [];
+  parts.forEach(function (p) {
+    if (p === '..') stack.pop();
+    else if (p === '.' || p === '') { /* skip */ }
+    else stack.push(p);
+  });
+  return stack.join('/');
+}
+
+function removeContentTypeOverride(ctDoc, ctNs, partName) {
+  const overrides = Array.prototype.slice.call(ctDoc.getElementsByTagNameNS(ctNs, 'Override'));
+  const el = overrides.filter(function (o) { return o.getAttribute('PartName') === partName; })[0];
+  if (el) el.parentNode.removeChild(el);
+}
+
+async function readRelsDoc(zip, parser, relsPath) {
+  const file = zip.file(relsPath);
+  if (!file) return null;
+  const text = await file.async('string');
+  return parser.parseFromString(text, 'application/xml');
+}
+
+// 如果既有的「工作表1」其實是一張「真正的 Excel 原生樞紐表」（不是我們自己算出來的純數值），
+// 直接覆寫它的內容會留下孤兒的 pivotTable/pivotCache 關聯，造成 Excel/Google 試算表疊出
+// 舊樞紐表的篩選下拉箭頭、分組收合符號。這裡把舊的這張表（連同它專屬的樞紐表/快取部件、
+// 相關的 relationship、Content_Types 宣告）完整清掉，讓後面可以乾淨地新增一張全新的分頁。
+async function removeExistingSheetFully(zip, parser, serializer, ns, relNs, relsRootNs, ctNs, wbDoc, sheetsEl, sheetEl, relsDoc, ctDoc) {
+  const rid = sheetEl.getAttributeNS(relNs, 'id');
+  const relEls = Array.prototype.slice.call(relsDoc.getElementsByTagNameNS(relsRootNs, 'Relationship'));
+  const relEl = relEls.filter(function (r) { return r.getAttribute('Id') === rid; })[0];
+  const wsPath = 'xl/' + relEl.getAttribute('Target').replace(/^\.?\//, '').replace(/^xl\//, '');
+  const wsDir = wsPath.substring(0, wsPath.lastIndexOf('/'));
+  const wsFileName = wsPath.substring(wsPath.lastIndexOf('/') + 1);
+  const wsRelsPath = wsDir + '/_rels/' + wsFileName + '.rels';
+
+  const wsRelsDoc = await readRelsDoc(zip, parser, wsRelsPath);
+  const pivotTablePaths = [];
+  if (wsRelsDoc) {
+    Array.prototype.slice.call(wsRelsDoc.getElementsByTagNameNS(relsRootNs, 'Relationship')).forEach(function (r) {
+      if (/\/pivotTable$/.test(r.getAttribute('Type'))) {
+        pivotTablePaths.push(resolveRelPath(wsDir, r.getAttribute('Target')));
+      }
+    });
+  }
+
+  sheetsEl.removeChild(sheetEl);
+  relEl.parentNode.removeChild(relEl);
+  removeContentTypeOverride(ctDoc, ctNs, '/' + wsPath);
+  zip.remove(wsPath);
+  if (wsRelsDoc) zip.remove(wsRelsPath);
+
+  for (let i = 0; i < pivotTablePaths.length; i++) {
+    const ptPath = pivotTablePaths[i];
+    const ptDir = ptPath.substring(0, ptPath.lastIndexOf('/'));
+    const ptFileName = ptPath.substring(ptPath.lastIndexOf('/') + 1);
+    const ptRelsPath = ptDir + '/_rels/' + ptFileName + '.rels';
+    const ptRelsDoc = await readRelsDoc(zip, parser, ptRelsPath);
+
+    removeContentTypeOverride(ctDoc, ctNs, '/' + ptPath);
+    zip.remove(ptPath);
+    if (ptRelsDoc) zip.remove(ptRelsPath);
+
+    if (!ptRelsDoc) continue;
+    const cacheRel = Array.prototype.slice.call(ptRelsDoc.getElementsByTagNameNS(relsRootNs, 'Relationship'))
+      .filter(function (r) { return /\/pivotCacheDefinition$/.test(r.getAttribute('Type')); })[0];
+    if (!cacheRel) continue;
+    const cacheDefPath = resolveRelPath(ptDir, cacheRel.getAttribute('Target'));
+
+    // 保守檢查：如果還有其他殘留的 pivotTable 共用同一份快取，就不要刪快取本體。
+    let stillUsed = false;
+    const remainingPtPaths = [];
+    zip.forEach(function (p) { if (/^xl\/pivotTables\/pivotTable\d+\.xml$/.test(p)) remainingPtPaths.push(p); });
+    for (let j = 0; j < remainingPtPaths.length; j++) {
+      const otherRelsPath = 'xl/pivotTables/_rels/' + remainingPtPaths[j].split('/').pop() + '.rels';
+      const otherFile = zip.file(otherRelsPath);
+      if (!otherFile) continue;
+      const otherText = await otherFile.async('string');
+      if (otherText.indexOf(cacheDefPath.split('/').pop()) !== -1) { stillUsed = true; break; }
+    }
+    if (stillUsed) continue;
+
+    const cdDir = cacheDefPath.substring(0, cacheDefPath.lastIndexOf('/'));
+    const cdFileName = cacheDefPath.substring(cacheDefPath.lastIndexOf('/') + 1);
+    const cdRelsPath = cdDir + '/_rels/' + cdFileName + '.rels';
+    const cdRelsDoc = await readRelsDoc(zip, parser, cdRelsPath);
+    let recordsPath = null;
+    if (cdRelsDoc) {
+      const recRel = Array.prototype.slice.call(cdRelsDoc.getElementsByTagNameNS(relsRootNs, 'Relationship'))
+        .filter(function (r) { return /\/pivotCacheRecords$/.test(r.getAttribute('Type')); })[0];
+      if (recRel) recordsPath = resolveRelPath(cdDir, recRel.getAttribute('Target'));
+    }
+
+    removeContentTypeOverride(ctDoc, ctNs, '/' + cacheDefPath);
+    zip.remove(cacheDefPath);
+    if (cdRelsDoc) zip.remove(cdRelsPath);
+    if (recordsPath) {
+      removeContentTypeOverride(ctDoc, ctNs, '/' + recordsPath);
+      zip.remove(recordsPath);
+    }
+
+    const wbRelEls = Array.prototype.slice.call(relsDoc.getElementsByTagNameNS(relsRootNs, 'Relationship'));
+    const cacheWbRel = wbRelEls.filter(function (r) { return resolveRelPath('xl', r.getAttribute('Target')) === cacheDefPath; })[0];
+    if (cacheWbRel) {
+      const cacheWbRid = cacheWbRel.getAttribute('Id');
+      cacheWbRel.parentNode.removeChild(cacheWbRel);
+      const pivotCachesEl = wbDoc.getElementsByTagNameNS(ns, 'pivotCaches')[0];
+      if (pivotCachesEl) {
+        const pcEls = Array.prototype.slice.call(pivotCachesEl.getElementsByTagNameNS(ns, 'pivotCache'));
+        const pcEl = pcEls.filter(function (p) { return p.getAttributeNS(relNs, 'id') === cacheWbRid; })[0];
+        if (pcEl) pivotCachesEl.removeChild(pcEl);
+        if (elementChildren(pivotCachesEl).length === 0) pivotCachesEl.parentNode.removeChild(pivotCachesEl);
+      }
+    }
+  }
+}
+
 async function buildOutputBlob(file, pivotRows) {
   const originalBuffer = await file.arrayBuffer();
   const zip = await JSZip.loadAsync(originalBuffer);
@@ -554,62 +684,54 @@ async function buildOutputBlob(file, pivotRows) {
   const relsPath = 'xl/_rels/workbook.xml.rels';
   const ctPath = '[Content_Types].xml';
 
-  const wbXmlText = await zip.file(wbXmlPath).async('string');
-  const wbDoc = parser.parseFromString(wbXmlText, 'application/xml');
+  const wbDoc = parser.parseFromString(await zip.file(wbXmlPath).async('string'), 'application/xml');
   const sheetsEl = wbDoc.getElementsByTagNameNS(ns, 'sheets')[0];
-  const sheetEls = Array.prototype.slice.call(sheetsEl.getElementsByTagNameNS(ns, 'sheet'));
-  const existingSheetEl = sheetEls.filter(function (s) { return s.getAttribute('name') === '工作表1'; })[0];
+  const relsDoc = parser.parseFromString(await zip.file(relsPath).async('string'), 'application/xml');
+  const ctDoc = parser.parseFromString(await zip.file(ctPath).async('string'), 'application/xml');
 
-  const relsText = await zip.file(relsPath).async('string');
-  const relsDoc = parser.parseFromString(relsText, 'application/xml');
-  const relEls = Array.prototype.slice.call(relsDoc.getElementsByTagNameNS(relsRootNs, 'Relationship'));
-
-  const ctText = await zip.file(ctPath).async('string');
-  const ctDoc = parser.parseFromString(ctText, 'application/xml');
-
-  let targetSheetPath;
-
+  let sheetEls = Array.prototype.slice.call(sheetsEl.getElementsByTagNameNS(ns, 'sheet'));
+  let existingSheetEl = sheetEls.filter(function (s) { return s.getAttribute('name') === '工作表1'; })[0];
   if (existingSheetEl) {
-    const rid = existingSheetEl.getAttributeNS(relNs, 'id');
-    const relEl = relEls.filter(function (r) { return r.getAttribute('Id') === rid; })[0];
-    const target = relEl.getAttribute('Target');
-    targetSheetPath = 'xl/' + target.replace(/^\.?\//, '').replace(/^xl\//, '');
-  } else {
-    const usedNums = [];
-    zip.forEach(function (path) {
-      const m = path.match(/^xl\/worksheets\/sheet(\d+)\.xml$/);
-      if (m) usedNums.push(parseInt(m[1], 10));
-    });
-    const nextNum = (usedNums.length ? Math.max.apply(null, usedNums) : 0) + 1;
-    targetSheetPath = 'xl/worksheets/sheet' + nextNum + '.xml';
-
-    const usedRids = relEls.map(function (r) { return parseInt(r.getAttribute('Id').replace('rId', ''), 10); }).filter(function (n) { return !Number.isNaN(n); });
-    const nextRid = 'rId' + ((usedRids.length ? Math.max.apply(null, usedRids) : 0) + 1);
-
-    const usedSheetIds = sheetEls.map(function (s) { return parseInt(s.getAttribute('sheetId'), 10); }).filter(function (n) { return !Number.isNaN(n); });
-    const nextSheetId = (usedSheetIds.length ? Math.max.apply(null, usedSheetIds) : 0) + 1;
-
-    const newSheetEl = wbDoc.createElementNS(ns, 'sheet');
-    newSheetEl.setAttribute('name', '工作表1');
-    newSheetEl.setAttribute('sheetId', String(nextSheetId));
-    newSheetEl.setAttributeNS(relNs, 'r:id', nextRid);
-    sheetsEl.appendChild(newSheetEl);
-
-    const newRelEl = relsDoc.createElementNS(relsRootNs, 'Relationship');
-    newRelEl.setAttribute('Id', nextRid);
-    newRelEl.setAttribute('Type', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet');
-    newRelEl.setAttribute('Target', 'worksheets/sheet' + nextNum + '.xml');
-    relsDoc.documentElement.appendChild(newRelEl);
-
-    const newOverrideEl = ctDoc.createElementNS(ctNs, 'Override');
-    newOverrideEl.setAttribute('PartName', '/' + targetSheetPath);
-    newOverrideEl.setAttribute('ContentType', 'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml');
-    ctDoc.documentElement.appendChild(newOverrideEl);
-
-    zip.file(wbXmlPath, serializer.serializeToString(wbDoc));
-    zip.file(relsPath, serializer.serializeToString(relsDoc));
-    zip.file(ctPath, serializer.serializeToString(ctDoc));
+    await removeExistingSheetFully(zip, parser, serializer, ns, relNs, relsRootNs, ctNs, wbDoc, sheetsEl, existingSheetEl, relsDoc, ctDoc);
   }
+
+  // 一律新增一張乾淨的「工作表1」，不沿用舊分頁可能帶的任何關聯。
+  const usedNums = [];
+  zip.forEach(function (path) {
+    const m = path.match(/^xl\/worksheets\/sheet(\d+)\.xml$/);
+    if (m) usedNums.push(parseInt(m[1], 10));
+  });
+  const nextNum = (usedNums.length ? Math.max.apply(null, usedNums) : 0) + 1;
+  const targetSheetPath = 'xl/worksheets/sheet' + nextNum + '.xml';
+
+  const relEls = Array.prototype.slice.call(relsDoc.getElementsByTagNameNS(relsRootNs, 'Relationship'));
+  const usedRids = relEls.map(function (r) { return parseInt(r.getAttribute('Id').replace('rId', ''), 10); }).filter(function (n) { return !Number.isNaN(n); });
+  const nextRid = 'rId' + ((usedRids.length ? Math.max.apply(null, usedRids) : 0) + 1);
+
+  sheetEls = Array.prototype.slice.call(sheetsEl.getElementsByTagNameNS(ns, 'sheet'));
+  const usedSheetIds = sheetEls.map(function (s) { return parseInt(s.getAttribute('sheetId'), 10); }).filter(function (n) { return !Number.isNaN(n); });
+  const nextSheetId = (usedSheetIds.length ? Math.max.apply(null, usedSheetIds) : 0) + 1;
+
+  const newSheetEl = wbDoc.createElementNS(ns, 'sheet');
+  newSheetEl.setAttribute('name', '工作表1');
+  newSheetEl.setAttribute('sheetId', String(nextSheetId));
+  newSheetEl.setAttributeNS(relNs, 'r:id', nextRid);
+  sheetsEl.appendChild(newSheetEl);
+
+  const newRelEl = relsDoc.createElementNS(relsRootNs, 'Relationship');
+  newRelEl.setAttribute('Id', nextRid);
+  newRelEl.setAttribute('Type', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet');
+  newRelEl.setAttribute('Target', 'worksheets/sheet' + nextNum + '.xml');
+  relsDoc.documentElement.appendChild(newRelEl);
+
+  const newOverrideEl = ctDoc.createElementNS(ctNs, 'Override');
+  newOverrideEl.setAttribute('PartName', '/' + targetSheetPath);
+  newOverrideEl.setAttribute('ContentType', 'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml');
+  ctDoc.documentElement.appendChild(newOverrideEl);
+
+  zip.file(wbXmlPath, serializer.serializeToString(wbDoc));
+  zip.file(relsPath, serializer.serializeToString(relsDoc));
+  zip.file(ctPath, serializer.serializeToString(ctDoc));
 
   const styleIds = await ensurePivotStyles(zip, parser, serializer);
   const sheetXml = buildPivotSheetXml(pivotRows, styleIds);
