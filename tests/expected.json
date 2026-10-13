@@ -1,0 +1,77 @@
+{
+  "_說明": "各來源檔經 tools/master-txt.html 轉出的產出雜湊。來源檔與產出檔都含商品主檔與零售價，不放進這個公開 repo，只存雜湊。",
+  "_基準來源": "由 ~/.claude/skills/converse-master-txt/scripts/excel_to_master_txt.py 產出並已實際交付使用的檔案",
+  "_建立日期": "2026-10-13",
+  "cases": [
+    {
+      "source": "CS_HO26貨品資料_20261001.xlsx",
+      "dropVoid": true,
+      "note": "erp-raw 單季（冬→20264），條碼全 12 碼，無作廢條碼與贈品",
+      "expect": {
+        "13": {
+          "sha256": "a766b6ec9d1c816431073adafd09a8f0030fee2aa41232c3d69a1a351e322ad5",
+          "bytes": 275846,
+          "lines": 1289
+        },
+        "12": {
+          "sha256": "b0973261e0d2f8161d8b61f35132e2f7cc275d8bddfd391a67c08f221d8e3f37",
+          "bytes": 275846,
+          "lines": 1289
+        }
+      }
+    },
+    {
+      "source": "CS_FA26+HO26貨品資料.xlsx",
+      "dropVoid": true,
+      "note": "erp-raw 混季節（秋 20263＋冬 20264），含 2 筆 DEL 作廢條碼、1 筆被 Excel 吃掉開頭 0 的 11 碼條碼",
+      "expect": {
+        "13": {
+          "sha256": "0b95f76a95bb6af40de62de50296fb22ec47d92416163e34867278af9bff3b32",
+          "bytes": 672174,
+          "lines": 3141
+        },
+        "12": {
+          "sha256": "80f364673ee2d83948d3800fadd626bdfc1bcc526eb55ebd681d07c30b9c6dd4",
+          "bytes": 672174,
+          "lines": 3141
+        }
+      }
+    },
+    {
+      "source": "Converse_FA26產品主檔20260921更新.xlsx",
+      "dropVoid": true,
+      "note": "erp-raw，條碼欄存成文字，含 4 筆贈品（大類 99）與 2 筆 DEL",
+      "expect": {
+        "13": {
+          "sha256": "6d15b818a0c05e84b6801279125e9bf0bac297badab38ab0071808d6e6957c9d",
+          "bytes": 893038,
+          "lines": 4173
+        }
+      }
+    },
+    {
+      "source": "Z & F品主檔.xlsx",
+      "dropVoid": true,
+      "note": "erp-raw 小檔，ZO&FRIENDS 聯名線",
+      "expect": {
+        "13": {
+          "sha256": "36ac2ec1e2aec2ca9cb5690b02fda75829ed2f0692b38ad3e2823048499ec99f",
+          "bytes": 20972,
+          "lines": 98
+        }
+      }
+    },
+    {
+      "source": "CS_FA26貨品資料_加工轉txt.xlsx",
+      "dropVoid": true,
+      "note": "preprocessed 版面（季度品牌貨號＋13碼對應條碼直接對應）",
+      "expect": {
+        "13": {
+          "sha256": "3e532155c83024ab589fbce8af2138b92d501cd15cf7f770e575b4af3e04c597",
+          "bytes": 298102,
+          "lines": 1393
+        }
+      }
+    }
+  ]
+}
