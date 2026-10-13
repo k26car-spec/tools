@@ -324,7 +324,21 @@ function buildPivot(rows) {
     });
   });
   pivotRows.push({ label: '總計', qty: grandQty, amt: grandAmt, kind: 'total' });
-  return { pivotRows: pivotRows, skippedTotalRows: skippedTotalRows };
+  return { pivotRows: pivotRows, skippedTotalRows: skippedTotalRows, customerOrder: customerOrder, groups: groups };
+}
+
+// 整份資料裡所有不重複的銷售出貨單號，依第一次出現的順序排列（跨客戶）。
+// 樞紐表快取裡「銷售出貨單號」欄位的索引要用這份全域清單，假設同一個
+// 單號只會出現在同一個客戶底下（目前看到的真實資料都符合這個假設）。
+function buildGlobalOrderList(rows) {
+  const seen = new Set();
+  const list = [];
+  rows.forEach(function (r) {
+    if (!toStr(r['客户'])) return;
+    const order = toStr(r['销售出货单号']);
+    if (!seen.has(order)) { seen.add(order); list.push(order); }
+  });
+  return list;
 }
 
 function el(tag, attrs, children) {
@@ -379,6 +393,194 @@ function parseCellRef(ref) {
   let col = 0;
   for (let i = 0; i < m[1].length; i++) col = col * 26 + (m[1].charCodeAt(i) - 64);
   return { col: col, row: parseInt(m[2], 10) };
+}
+
+function isNumericRaw(v) {
+  if (typeof v === 'number') return true;
+  if (v && typeof v === 'object' && 'result' in v) return typeof v.result === 'number';
+  return false;
+}
+
+// Sheet1 刪掉 DELETE_COLS 之後實際會剩下哪些欄位（依原始順序），用來讓樞紐表
+// 快取（pivotCache）的欄位結構跟實際 Sheet1 的欄位結構保持一致。隱藏的欄位
+// 不受影響（只是不顯示，資料欄位還在）。回傳 0-based 陣列。
+function buildSurvivingHeaders(headerByIndex) {
+  const maxCol = headerByIndex.length - 1;
+  const survivors = [];
+  for (let i = 1; i <= maxCol; i++) {
+    const name = headerByIndex[i];
+    if (name && DELETE_COLS.indexOf(name) !== -1) continue;
+    survivors.push(name || ('Column' + i));
+  }
+  return survivors;
+}
+
+// ---- 原生 Excel 樞紐表：pivotCache（資料快取）+ pivotTable（版面定義） ----
+// 這樣「工作表1」會是一張真正可以互動的樞紐表：列標籤旁有篩選下拉箭頭，
+// 可以勾選要顯示哪些客戶/單號、也可以展開收合，不是純文字的靜態表格。
+
+function buildPivotCacheParts(includedRows, survivingHeaders, sheetName, sourceRef, customerOrder, globalOrderList) {
+  const customerIndex = new Map(customerOrder.map(function (c, i) { return [c, i]; }));
+  const orderIndex = new Map(globalOrderList.map(function (o, i) { return [o, i]; }));
+
+  const cacheFieldsXml = survivingHeaders.map(function (name) {
+    if (name === '客户') {
+      const items = customerOrder.map(function (v) { return '<s v="' + escapeXml(v) + '"/>'; }).join('');
+      return '<cacheField name="' + escapeXml(name) + '" numFmtId="0"><sharedItems count="' + customerOrder.length + '">' + items + '</sharedItems></cacheField>';
+    }
+    if (name === '销售出货单号') {
+      const items = globalOrderList.map(function (v) { return '<s v="' + escapeXml(v) + '"/>'; }).join('');
+      return '<cacheField name="' + escapeXml(name) + '" numFmtId="0"><sharedItems count="' + globalOrderList.length + '">' + items + '</sharedItems></cacheField>';
+    }
+    return '<cacheField name="' + escapeXml(name) + '" numFmtId="0"><sharedItems/></cacheField>';
+  }).join('');
+
+  const recordsXml = includedRows.map(function (r) {
+    const cellsXml = survivingHeaders.map(function (name) {
+      const raw = r[name];
+      if (name === '客户') return '<x v="' + customerIndex.get(toStr(raw)) + '"/>';
+      if (name === '销售出货单号') return '<x v="' + orderIndex.get(toStr(raw)) + '"/>';
+      if (isNumericRaw(raw)) return '<n v="' + toNum(raw) + '"/>';
+      return '<s v="' + escapeXml(toStr(raw)) + '"/>';
+    }).join('');
+    return '<r>' + cellsXml + '</r>';
+  }).join('');
+
+  const cacheDefXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1" refreshedBy="樞紐分析工具" refreshedDate="0" createdVersion="6" refreshedVersion="6" minRefreshableVersion="3" recordCount="' + includedRows.length + '">' +
+    '<cacheSource type="worksheet"><worksheetSource ref="' + sourceRef + '" sheet="' + escapeXml(sheetName) + '"/></cacheSource>' +
+    '<cacheFields count="' + survivingHeaders.length + '">' + cacheFieldsXml + '</cacheFields>' +
+    '</pivotCacheDefinition>';
+
+  const cacheRecordsXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<pivotCacheRecords xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" count="' + includedRows.length + '">' + recordsXml + '</pivotCacheRecords>';
+
+  return { cacheDefXml: cacheDefXml, cacheRecordsXml: cacheRecordsXml };
+}
+
+function buildPivotTableDefXml(survivingHeaders, customerOrder, groups, globalOrderList, locationRef, cacheId, tableName) {
+  const customerFieldIdx = survivingHeaders.indexOf('客户');
+  const orderFieldIdx = survivingHeaders.indexOf('销售出货单号');
+  const qtyFieldIdx = survivingHeaders.indexOf('出货数量');
+  const amtFieldIdx = survivingHeaders.indexOf('出货金额');
+
+  const pivotFieldsXml = survivingHeaders.map(function (name) {
+    if (name === '客户') {
+      const items = customerOrder.map(function (_, i) { return '<item x="' + i + '"/>'; }).join('');
+      return '<pivotField axis="axisRow" showAll="0" defaultSubtotal="0"><items count="' + customerOrder.length + '">' + items + '</items></pivotField>';
+    }
+    if (name === '销售出货单号') {
+      const items = globalOrderList.map(function (_, i) { return '<item x="' + i + '"/>'; }).join('');
+      return '<pivotField axis="axisRow" showAll="0" defaultSubtotal="0"><items count="' + globalOrderList.length + '">' + items + '</items></pivotField>';
+    }
+    if (name === '出货数量') return '<pivotField dataField="1" numFmtId="3" showAll="0" defaultSubtotal="0"/>';
+    if (name === '出货金额') return '<pivotField dataField="1" numFmtId="4" showAll="0" defaultSubtotal="0"/>';
+    return '<pivotField showAll="0" defaultSubtotal="0"/>';
+  }).join('');
+
+  const rowItemsXml = [];
+  customerOrder.forEach(function (customer, ci) {
+    rowItemsXml.push(ci === 0 ? '<i><x/></i>' : '<i><x v="' + ci + '"/></i>');
+    const g = groups.get(customer);
+    g.orderOrder.forEach(function (order) {
+      const oi = globalOrderList.indexOf(order);
+      rowItemsXml.push(oi === 0 ? '<i r="1"><x/></i>' : '<i r="1"><x v="' + oi + '"/></i>');
+    });
+  });
+  rowItemsXml.push('<i t="grand"><x/></i>');
+
+  return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="' + escapeXml(tableName) + '" cacheId="' + cacheId + '" applyNumberFormats="0" applyBorderFormats="0" applyFontFormats="0" applyPatternFormats="0" applyAlignmentFormats="0" applyWidthHeightFormats="1" dataCaption="數值" updatedVersion="6" minRefreshableVersion="3" useAutoFormatting="1" itemPrintTitles="1" createdVersion="6" indent="0" outline="1" outlineData="1" multipleFieldFilters="0">' +
+    '<location ref="' + locationRef + '" firstHeaderRow="0" firstDataRow="1" firstDataCol="1"/>' +
+    '<pivotFields count="' + survivingHeaders.length + '">' + pivotFieldsXml + '</pivotFields>' +
+    '<rowFields count="2"><field x="' + customerFieldIdx + '"/><field x="' + orderFieldIdx + '"/></rowFields>' +
+    '<rowItems count="' + rowItemsXml.length + '">' + rowItemsXml.join('') + '</rowItems>' +
+    '<colFields count="1"><field x="-2"/></colFields>' +
+    '<colItems count="2"><i><x/></i><i i="1"><x v="1"/></i></colItems>' +
+    '<dataFields count="2">' +
+    '<dataField name="加總 - 出货数量" fld="' + qtyFieldIdx + '" baseField="0" baseItem="0"/>' +
+    '<dataField name="加總 - 出货金额" fld="' + amtFieldIdx + '" baseField="0" baseItem="0" numFmtId="4"/>' +
+    '</dataFields>' +
+    '<pivotTableStyleInfo name="PivotStyleLight16" showRowHeaders="1" showColHeaders="1" showRowStripes="0" showColStripes="0" showLastColumn="1"/>' +
+    '</pivotTableDefinition>';
+}
+
+// 把一張原生樞紐表的所有部件（pivotCache定義+快取記錄+pivotTable版面）加進 zip，
+// 並且把 workbook.xml 的 <pivotCaches>、worksheet 自己的 _rels、[Content_Types].xml
+// 該補的宣告都補齊。cacheId/部件編號一律掃描既有檔案找出下一個可用的號碼，
+// 不會跟其他既有的樞紐表（如果原始檔案裡還有別的）衝突。
+async function addNativePivotTable(zip, ns, relNs, relsRootNs, ctNs, wbDoc, relsDoc, ctDoc, targetSheetPath, pivotRows, customerOrder, groups, headerByIndex, includedRows) {
+  const survivingHeaders = buildSurvivingHeaders(headerByIndex);
+  if (survivingHeaders.indexOf('客户') === -1 || survivingHeaders.indexOf('销售出货单号') === -1 ||
+      survivingHeaders.indexOf('出货数量') === -1 || survivingHeaders.indexOf('出货金额') === -1) {
+    return; // 保險：必要欄位不在了就不做原生樞紐表，純數值表格還是會照常輸出
+  }
+  const globalOrderList = buildGlobalOrderList(includedRows);
+
+  const usedCacheDefNums = [];
+  zip.forEach(function (p) { const m = p.match(/^xl\/pivotCache\/pivotCacheDefinition(\d+)\.xml$/); if (m) usedCacheDefNums.push(parseInt(m[1], 10)); });
+  const cacheDefNum = (usedCacheDefNums.length ? Math.max.apply(null, usedCacheDefNums) : 0) + 1;
+
+  const usedPtNums = [];
+  zip.forEach(function (p) { const m = p.match(/^xl\/pivotTables\/pivotTable(\d+)\.xml$/); if (m) usedPtNums.push(parseInt(m[1], 10)); });
+  const ptNum = (usedPtNums.length ? Math.max.apply(null, usedPtNums) : 0) + 1;
+
+  const usedCacheIds = Array.prototype.slice.call(wbDoc.getElementsByTagNameNS(ns, 'pivotCache'))
+    .map(function (el) { return parseInt(el.getAttribute('cacheId'), 10); }).filter(function (n) { return !Number.isNaN(n); });
+  const cacheId = (usedCacheIds.length ? Math.max.apply(null, usedCacheIds) : 0) + 1;
+
+  const sourceRef = 'A1:' + colLetter(survivingHeaders.length) + (includedRows.length + 1);
+  const { cacheDefXml, cacheRecordsXml } = buildPivotCacheParts(includedRows, survivingHeaders, 'Sheet1', sourceRef, customerOrder, globalOrderList);
+
+  const locationRef = 'A1:C' + (pivotRows.length + 1);
+  const pivotTableXml = buildPivotTableDefXml(survivingHeaders, customerOrder, groups, globalOrderList, locationRef, cacheId, '樞紐分析表' + cacheId);
+
+  const cacheDefPath = 'xl/pivotCache/pivotCacheDefinition' + cacheDefNum + '.xml';
+  const cacheRecordsPath = 'xl/pivotCache/pivotCacheRecords' + cacheDefNum + '.xml';
+  const ptPath = 'xl/pivotTables/pivotTable' + ptNum + '.xml';
+
+  zip.file(cacheDefPath, cacheDefXml);
+  zip.file(cacheRecordsPath, cacheRecordsXml);
+  zip.file('xl/pivotCache/_rels/pivotCacheDefinition' + cacheDefNum + '.xml.rels',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="' + relsRootNs + '"><Relationship Id="rId1" Type="' + relNs + '/pivotCacheRecords" Target="pivotCacheRecords' + cacheDefNum + '.xml"/></Relationships>');
+
+  zip.file(ptPath, pivotTableXml);
+  zip.file('xl/pivotTables/_rels/pivotTable' + ptNum + '.xml.rels',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="' + relsRootNs + '"><Relationship Id="rId1" Type="' + relNs + '/pivotCacheDefinition" Target="../pivotCache/pivotCacheDefinition' + cacheDefNum + '.xml"/></Relationships>');
+
+  const wsDir = targetSheetPath.substring(0, targetSheetPath.lastIndexOf('/'));
+  const wsFileName = targetSheetPath.substring(targetSheetPath.lastIndexOf('/') + 1);
+  zip.file(wsDir + '/_rels/' + wsFileName + '.rels',
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="' + relsRootNs + '"><Relationship Id="rId1" Type="' + relNs + '/pivotTable" Target="../pivotTables/pivotTable' + ptNum + '.xml"/></Relationships>');
+
+  let pivotCachesEl = wbDoc.getElementsByTagNameNS(ns, 'pivotCaches')[0];
+  if (!pivotCachesEl) {
+    pivotCachesEl = wbDoc.createElementNS(ns, 'pivotCaches');
+    wbDoc.documentElement.appendChild(pivotCachesEl);
+  }
+  const usedWbRids = Array.prototype.slice.call(relsDoc.getElementsByTagNameNS(relsRootNs, 'Relationship'))
+    .map(function (r) { return parseInt(r.getAttribute('Id').replace('rId', ''), 10); }).filter(function (n) { return !Number.isNaN(n); });
+  const cacheWbRid = 'rId' + ((usedWbRids.length ? Math.max.apply(null, usedWbRids) : 0) + 1);
+  const pivotCacheEl = wbDoc.createElementNS(ns, 'pivotCache');
+  pivotCacheEl.setAttribute('cacheId', String(cacheId));
+  pivotCacheEl.setAttributeNS(relNs, 'r:id', cacheWbRid);
+  pivotCachesEl.appendChild(pivotCacheEl);
+
+  const cacheRelEl = relsDoc.createElementNS(relsRootNs, 'Relationship');
+  cacheRelEl.setAttribute('Id', cacheWbRid);
+  cacheRelEl.setAttribute('Type', relNs + '/pivotCacheDefinition');
+  cacheRelEl.setAttribute('Target', 'pivotCache/pivotCacheDefinition' + cacheDefNum + '.xml');
+  relsDoc.documentElement.appendChild(cacheRelEl);
+
+  function addOverride(part, type) {
+    const o = ctDoc.createElementNS(ctNs, 'Override');
+    o.setAttribute('PartName', part);
+    o.setAttribute('ContentType', type);
+    ctDoc.documentElement.appendChild(o);
+  }
+  addOverride('/' + cacheDefPath, 'application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml');
+  addOverride('/' + cacheRecordsPath, 'application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheRecords+xml');
+  addOverride('/' + ptPath, 'application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml');
 }
 
 // 把 Sheet1 裡指定的欄位隱藏（保留資料，只是不顯示）或整欄刪掉（資料跟著消失，
@@ -794,7 +996,7 @@ async function removeExistingSheetFully(zip, parser, serializer, ns, relNs, rels
   }
 }
 
-async function buildOutputBlob(file, pivotRows, headerByIndex) {
+async function buildOutputBlob(file, pivotRows, headerByIndex, customerOrder, groups, includedRows) {
   const originalBuffer = await file.arrayBuffer();
   const zip = await JSZip.loadAsync(originalBuffer);
   const parser = new DOMParser();
@@ -854,18 +1056,26 @@ async function buildOutputBlob(file, pivotRows, headerByIndex) {
   newOverrideEl.setAttribute('ContentType', 'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml');
   ctDoc.documentElement.appendChild(newOverrideEl);
 
-  zip.file(wbXmlPath, serializer.serializeToString(wbDoc));
-  zip.file(relsPath, serializer.serializeToString(relsDoc));
-  zip.file(ctPath, serializer.serializeToString(ctDoc));
-
   const styleIds = await ensurePivotStyles(zip, parser, serializer);
   const sheetXml = buildPivotSheetXml(pivotRows, styleIds);
   zip.file(targetSheetPath, sheetXml);
 
+  let pivotTableOk = true;
+  try {
+    await addNativePivotTable(zip, ns, relNs, relsRootNs, ctNs, wbDoc, relsDoc, ctDoc, targetSheetPath, pivotRows, customerOrder, groups, headerByIndex, includedRows);
+  } catch (e) {
+    pivotTableOk = false;
+    console.error('原生樞紐表建立失敗，改用純數值表格：', e);
+  }
+
+  zip.file(wbXmlPath, serializer.serializeToString(wbDoc));
+  zip.file(relsPath, serializer.serializeToString(relsDoc));
+  zip.file(ctPath, serializer.serializeToString(ctDoc));
+
   const colChanges = await hideAndDeleteColumns(zip, parser, serializer, ns, relNs, relsRootNs, wbDoc, relsDoc, headerByIndex);
 
   const blob = await zip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
-  return { blob: blob, colChanges: colChanges };
+  return { blob: blob, colChanges: colChanges, pivotTableOk: pivotTableOk };
 }
 
 async function run() {
@@ -888,17 +1098,22 @@ async function run() {
     checkRequiredCols(headers);
     if (!rows.length) throw new Error('Sheet1 裡沒有讀到任何資料列。');
 
-    const { pivotRows, skippedTotalRows } = buildPivot(rows);
+    const { pivotRows, skippedTotalRows, customerOrder, groups } = buildPivot(rows);
     const totalRow = pivotRows[pivotRows.length - 1];
+    const includedRows = rows.filter(function (r) { return !!toStr(r['客户']); });
 
-    const { blob, colChanges } = await buildOutputBlob(file, pivotRows, headerByIndex);
+    const { blob, colChanges, pivotTableOk } = await buildOutputBlob(file, pivotRows, headerByIndex, customerOrder, groups, includedRows);
 
     let msg = '分析完成，共 ' + rows.length + ' 筆明細';
     if (skippedTotalRows) {
       msg += '（其中 ' + skippedTotalRows + ' 筆是報表自帶的總計列，已排除不計入）';
     }
-    msg += '，出貨數量加總 ' + fmtNum(totalRow.qty) + '、出貨金額加總 ' + fmtNum(totalRow.amt) +
-      '。下方「工作表1」會加進下載檔案裡，原本的分頁、格式都會保留。';
+    msg += '，出貨數量加總 ' + fmtNum(totalRow.qty) + '、出貨金額加總 ' + fmtNum(totalRow.amt) + '。';
+    if (pivotTableOk) {
+      msg += '下方「工作表1」會加進下載檔案裡，是一張真正可以互動的 Excel 樞紐表（列標籤可以篩選/展開收合），原本的分頁、格式都會保留。';
+    } else {
+      msg += '下方「工作表1」會加進下載檔案裡（純數值表格，這次原生樞紐表建立失敗，已自動改用一般表格），原本的分頁、格式都會保留。';
+    }
     if (colChanges.hiddenCount || colChanges.deletedCount) {
       msg += ' Sheet1 另外隱藏了 ' + colChanges.hiddenCount + ' 個欄位、刪除了 ' + colChanges.deletedCount + ' 個欄位。';
     }
