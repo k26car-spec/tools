@@ -196,6 +196,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
 'use strict';
 
 const REQUIRED_COLS = ['客户', '销售出货单号', '出货数量', '出货金额'];
+const HIDE_COLS = ['销售出/入库单号', '出库单生效日期'];
+const DELETE_COLS = ['出库数量', '出库金额', '出库零售额', '实际销售数量', '实际销售金额', '实际零售额'];
 
 function toStr(v) {
   if (v === null || v === undefined) return '';
@@ -262,7 +264,7 @@ function sheetToRows(ws) {
   });
 
   const headerNames = headers.filter(function (h) { return !!h; });
-  return { rows: rows, headers: headerNames };
+  return { rows: rows, headers: headerNames, headerByIndex: headers };
 }
 
 function checkRequiredCols(headers) {
@@ -370,6 +372,129 @@ function colLetter(n) {
     n = Math.floor((n - 1) / 26);
   }
   return s;
+}
+
+function parseCellRef(ref) {
+  const m = ref.match(/^([A-Z]+)(\d+)$/);
+  let col = 0;
+  for (let i = 0; i < m[1].length; i++) col = col * 26 + (m[1].charCodeAt(i) - 64);
+  return { col: col, row: parseInt(m[2], 10) };
+}
+
+// 把 Sheet1 裡指定的欄位隱藏（保留資料，只是不顯示）或整欄刪掉（資料跟著消失，
+// 後面欄位的 r="X123" 座標會往前遞補）。用 headerByIndex（欄位名稱→欄位編號）
+// 找出目標欄位實際在第幾欄，而不是寫死固定位置，這樣不管原始報表欄位順序/
+// 數量怎麼變化都抓得到；找不到的欄位名稱就跳過，不會報錯。
+async function hideAndDeleteColumns(zip, parser, serializer, ns, relNs, relsRootNs, wbDoc, relsDoc, headerByIndex) {
+  const sheetsEl = wbDoc.getElementsByTagNameNS(ns, 'sheets')[0];
+  const sheetEls = Array.prototype.slice.call(sheetsEl.getElementsByTagNameNS(ns, 'sheet'));
+  const sheet1El = sheetEls.filter(function (s) { return s.getAttribute('name') === 'Sheet1'; })[0];
+  if (!sheet1El) return { hiddenCount: 0, deletedCount: 0 };
+
+  const hideSet = {};
+  HIDE_COLS.forEach(function (name) {
+    const idx = headerByIndex.indexOf(name);
+    if (idx > 0) hideSet[idx] = true;
+  });
+  const deleteSet = {};
+  DELETE_COLS.forEach(function (name) {
+    const idx = headerByIndex.indexOf(name);
+    if (idx > 0) deleteSet[idx] = true;
+  });
+  const hiddenCount = Object.keys(hideSet).length;
+  const deletedCount = Object.keys(deleteSet).length;
+  if (!hiddenCount && !deletedCount) return { hiddenCount: 0, deletedCount: 0 };
+
+  const rid = sheet1El.getAttributeNS(relNs, 'id');
+  const relEls = Array.prototype.slice.call(relsDoc.getElementsByTagNameNS(relsRootNs, 'Relationship'));
+  const relEl = relEls.filter(function (r) { return r.getAttribute('Id') === rid; })[0];
+  const wsPath = 'xl/' + relEl.getAttribute('Target').replace(/^\.?\//, '').replace(/^xl\//, '');
+
+  const maxCol = headerByIndex.length - 1;
+  const remap = {};
+  let next = 1;
+  for (let old = 1; old <= maxCol; old++) {
+    if (deleteSet[old]) continue;
+    remap[old] = next;
+    next++;
+  }
+  const newMaxCol = next - 1;
+
+  const wsText = await zip.file(wsPath).async('string');
+  const wsDoc = parser.parseFromString(wsText, 'application/xml');
+  const wsRoot = wsDoc.documentElement;
+
+  const rowEls = Array.prototype.slice.call(wsRoot.getElementsByTagNameNS(ns, 'row'));
+  rowEls.forEach(function (rowEl) {
+    const cellEls = Array.prototype.slice.call(rowEl.getElementsByTagNameNS(ns, 'c'));
+    cellEls.forEach(function (c) {
+      const ref = c.getAttribute('r');
+      if (!ref) return;
+      const parsed = parseCellRef(ref);
+      if (deleteSet[parsed.col]) {
+        c.parentNode.removeChild(c);
+        return;
+      }
+      const newCol = remap[parsed.col];
+      if (newCol && newCol !== parsed.col) {
+        c.setAttribute('r', colLetter(newCol) + parsed.row);
+      }
+    });
+    if (rowEl.hasAttribute('spans')) rowEl.removeAttribute('spans');
+  });
+
+  const colsEl = wsRoot.getElementsByTagNameNS(ns, 'cols')[0];
+  if (colsEl) {
+    const colAttrs = {};
+    Array.prototype.slice.call(colsEl.getElementsByTagNameNS(ns, 'col')).forEach(function (colEl) {
+      const min = parseInt(colEl.getAttribute('min'), 10);
+      const max = parseInt(colEl.getAttribute('max'), 10);
+      for (let i = min; i <= max; i++) {
+        colAttrs[i] = {
+          width: colEl.getAttribute('width'),
+          customWidth: colEl.getAttribute('customWidth'),
+          style: colEl.getAttribute('style'),
+        };
+      }
+    });
+    while (colsEl.firstChild) colsEl.removeChild(colsEl.firstChild);
+    for (let old = 1; old <= maxCol; old++) {
+      if (deleteSet[old]) continue;
+      const newIdx = remap[old];
+      const attrs = colAttrs[old] || {};
+      const colEl = wsDoc.createElementNS(ns, 'col');
+      colEl.setAttribute('min', String(newIdx));
+      colEl.setAttribute('max', String(newIdx));
+      if (attrs.width) colEl.setAttribute('width', attrs.width);
+      if (attrs.customWidth) colEl.setAttribute('customWidth', attrs.customWidth);
+      if (attrs.style) colEl.setAttribute('style', attrs.style);
+      if (hideSet[old]) colEl.setAttribute('hidden', '1');
+      colsEl.appendChild(colEl);
+    }
+  } else if (hiddenCount) {
+    const newColsEl = wsDoc.createElementNS(ns, 'cols');
+    Object.keys(hideSet).forEach(function (oldIdxStr) {
+      const newIdx = remap[parseInt(oldIdxStr, 10)];
+      if (!newIdx) return;
+      const colEl = wsDoc.createElementNS(ns, 'col');
+      colEl.setAttribute('min', String(newIdx));
+      colEl.setAttribute('max', String(newIdx));
+      colEl.setAttribute('width', '9.140625');
+      colEl.setAttribute('hidden', '1');
+      newColsEl.appendChild(colEl);
+    });
+    const sheetDataEl = wsRoot.getElementsByTagNameNS(ns, 'sheetData')[0];
+    wsRoot.insertBefore(newColsEl, sheetDataEl);
+  }
+
+  const dimEl = wsRoot.getElementsByTagNameNS(ns, 'dimension')[0];
+  if (dimEl) {
+    const m = dimEl.getAttribute('ref').match(/^([A-Z]+\d+):[A-Z]+(\d+)$/);
+    if (m) dimEl.setAttribute('ref', m[1] + ':' + colLetter(newMaxCol) + m[2]);
+  }
+
+  zip.file(wsPath, serializer.serializeToString(wsDoc));
+  return { hiddenCount: hiddenCount, deletedCount: deletedCount };
 }
 
 function escapeXml(s) {
@@ -669,7 +794,7 @@ async function removeExistingSheetFully(zip, parser, serializer, ns, relNs, rels
   }
 }
 
-async function buildOutputBlob(file, pivotRows) {
+async function buildOutputBlob(file, pivotRows, headerByIndex) {
   const originalBuffer = await file.arrayBuffer();
   const zip = await JSZip.loadAsync(originalBuffer);
   const parser = new DOMParser();
@@ -737,7 +862,10 @@ async function buildOutputBlob(file, pivotRows) {
   const sheetXml = buildPivotSheetXml(pivotRows, styleIds);
   zip.file(targetSheetPath, sheetXml);
 
-  return zip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  const colChanges = await hideAndDeleteColumns(zip, parser, serializer, ns, relNs, relsRootNs, wbDoc, relsDoc, headerByIndex);
+
+  const blob = await zip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  return { blob: blob, colChanges: colChanges };
 }
 
 async function run() {
@@ -756,12 +884,14 @@ async function run() {
   try {
     const wb = await loadWorkbookReadOnly(file);
     const ws = getSheet(wb, 'Sheet1');
-    const { rows, headers } = sheetToRows(ws);
+    const { rows, headers, headerByIndex } = sheetToRows(ws);
     checkRequiredCols(headers);
     if (!rows.length) throw new Error('Sheet1 裡沒有讀到任何資料列。');
 
     const { pivotRows, skippedTotalRows } = buildPivot(rows);
     const totalRow = pivotRows[pivotRows.length - 1];
+
+    const { blob, colChanges } = await buildOutputBlob(file, pivotRows, headerByIndex);
 
     let msg = '分析完成，共 ' + rows.length + ' 筆明細';
     if (skippedTotalRows) {
@@ -769,10 +899,12 @@ async function run() {
     }
     msg += '，出貨數量加總 ' + fmtNum(totalRow.qty) + '、出貨金額加總 ' + fmtNum(totalRow.amt) +
       '。下方「工作表1」會加進下載檔案裡，原本的分頁、格式都會保留。';
+    if (colChanges.hiddenCount || colChanges.deletedCount) {
+      msg += ' Sheet1 另外隱藏了 ' + colChanges.hiddenCount + ' 個欄位、刪除了 ' + colChanges.deletedCount + ' 個欄位。';
+    }
     resultArea.appendChild(el('div', { class: 'result-box ok', text: msg }));
     resultArea.appendChild(renderPreview(pivotRows));
 
-    const blob = await buildOutputBlob(file, pivotRows);
     const baseName = file.name.replace(/\.(xlsx|xls)$/i, '');
     const filename = baseName + '_樞紐分析.xlsx';
     const url = URL.createObjectURL(blob);
