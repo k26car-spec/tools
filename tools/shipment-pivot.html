@@ -381,22 +381,154 @@ function escapeXml(s) {
     .replace(/'/g, '&apos;');
 }
 
-function buildPivotSheetXml(pivotRows) {
-  const allRows = [['列標籤', '加總 - 出货数量', '加總 - 出货金额']];
-  pivotRows.forEach(function (r) { allRows.push([r.label, r.qty, r.amt]); });
+// ---- 樣式：在 styles.xml 裡「只增不改」附加字型/填色/框線/格式，---
+// ---- 既有的 cellXfs 索引完全不動，其他分頁的樣式不受影響。 ----
 
-  const rowsXml = allRows.map(function (cells, idx) {
+const STYLE_ORDER = ['numFmts', 'fonts', 'fills', 'borders', 'cellStyleXfs', 'cellXfs', 'cellStyles', 'dxfs', 'tableStyles', 'colors', 'extLst'];
+
+function elementChildren(node) {
+  return Array.prototype.filter.call(node.childNodes, function (n) { return n.nodeType === 1; });
+}
+
+function getOrCreateStyleChild(doc, root, tagName) {
+  const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+  const existing = elementChildren(root).filter(function (n) { return n.localName === tagName; })[0];
+  if (existing) return existing;
+  const el = doc.createElementNS(ns, tagName);
+  el.setAttribute('count', '0');
+  const idx = STYLE_ORDER.indexOf(tagName);
+  let refNode = null;
+  for (let i = idx + 1; i < STYLE_ORDER.length; i++) {
+    const candidate = elementChildren(root).filter(function (n) { return n.localName === STYLE_ORDER[i]; })[0];
+    if (candidate) { refNode = candidate; break; }
+  }
+  if (refNode) root.insertBefore(el, refNode);
+  else root.appendChild(el);
+  return el;
+}
+
+function appendAndCount(parent, childEl) {
+  parent.appendChild(childEl);
+  const count = elementChildren(parent).length;
+  parent.setAttribute('count', String(count));
+  return count - 1;
+}
+
+async function ensurePivotStyles(zip, parser, serializer) {
+  const ns = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+  const path = 'xl/styles.xml';
+  const file = zip.file(path);
+  const text = file ? await file.async('string') : null;
+  const doc = text
+    ? parser.parseFromString(text, 'application/xml')
+    : parser.parseFromString('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="' + ns + '"/>', 'application/xml');
+  const root = doc.documentElement;
+
+  const numFmtsEl = getOrCreateStyleChild(doc, root, 'numFmts');
+  const existingIds = elementChildren(numFmtsEl).map(function (n) { return parseInt(n.getAttribute('numFmtId'), 10); }).filter(function (n) { return !Number.isNaN(n); });
+  const numFmtId = Math.max(163, existingIds.length ? Math.max.apply(null, existingIds) : 163) + 1;
+  const numFmtEl = doc.createElementNS(ns, 'numFmt');
+  numFmtEl.setAttribute('numFmtId', String(numFmtId));
+  numFmtEl.setAttribute('formatCode', '#,##0.##');
+  numFmtsEl.appendChild(numFmtEl);
+  numFmtsEl.setAttribute('count', String(elementChildren(numFmtsEl).length));
+
+  const fontsEl = getOrCreateStyleChild(doc, root, 'fonts');
+  const boldFontEl = doc.createElementNS(ns, 'font');
+  const bEl = doc.createElementNS(ns, 'b');
+  const szEl = doc.createElementNS(ns, 'sz'); szEl.setAttribute('val', '10');
+  const nameEl = doc.createElementNS(ns, 'name'); nameEl.setAttribute('val', 'Arial');
+  boldFontEl.appendChild(bEl); boldFontEl.appendChild(szEl); boldFontEl.appendChild(nameEl);
+  const fontBoldId = appendAndCount(fontsEl, boldFontEl);
+
+  const fillsEl = getOrCreateStyleChild(doc, root, 'fills');
+  function makeFill(rgb) {
+    const fillEl = doc.createElementNS(ns, 'fill');
+    const patEl = doc.createElementNS(ns, 'patternFill'); patEl.setAttribute('patternType', 'solid');
+    const fgEl = doc.createElementNS(ns, 'fgColor'); fgEl.setAttribute('rgb', rgb);
+    const bgEl = doc.createElementNS(ns, 'bgColor'); bgEl.setAttribute('indexed', '64');
+    patEl.appendChild(fgEl); patEl.appendChild(bgEl);
+    fillEl.appendChild(patEl);
+    return appendAndCount(fillsEl, fillEl);
+  }
+  const fillHeaderId = makeFill('FFF0F2F5');
+  const fillGroupId = makeFill('FFF7F8FA');
+  const fillTotalId = makeFill('FFEEF1F6');
+
+  const bordersEl = getOrCreateStyleChild(doc, root, 'borders');
+  const borderEl = doc.createElementNS(ns, 'border');
+  ['left', 'right', 'top', 'bottom'].forEach(function (side) {
+    const sideEl = doc.createElementNS(ns, side);
+    sideEl.setAttribute('style', 'thin');
+    const colorEl = doc.createElementNS(ns, 'color');
+    colorEl.setAttribute('rgb', 'FFE2E5EA');
+    sideEl.appendChild(colorEl);
+    borderEl.appendChild(sideEl);
+  });
+  borderEl.appendChild(doc.createElementNS(ns, 'diagonal'));
+  const borderThinId = appendAndCount(bordersEl, borderEl);
+
+  const cellXfsEl = getOrCreateStyleChild(doc, root, 'cellXfs');
+  function makeXf(opts) {
+    const xf = doc.createElementNS(ns, 'xf');
+    xf.setAttribute('numFmtId', String(opts.numFmtId || 0));
+    xf.setAttribute('fontId', String(opts.fontId || 0));
+    xf.setAttribute('fillId', String(opts.fillId || 0));
+    xf.setAttribute('borderId', String(opts.borderId || 0));
+    xf.setAttribute('xfId', '0');
+    if (opts.numFmtId) xf.setAttribute('applyNumberFormat', '1');
+    if (opts.fontId) xf.setAttribute('applyFont', '1');
+    if (opts.fillId) xf.setAttribute('applyFill', '1');
+    if (opts.borderId) xf.setAttribute('applyBorder', '1');
+    if (opts.align) {
+      xf.setAttribute('applyAlignment', '1');
+      const alignEl = doc.createElementNS(ns, 'alignment');
+      alignEl.setAttribute('horizontal', opts.align);
+      xf.appendChild(alignEl);
+    }
+    return appendAndCount(cellXfsEl, xf);
+  }
+
+  const styleIds = {
+    header: makeXf({ fontId: fontBoldId, fillId: fillHeaderId, borderId: borderThinId }),
+    group: makeXf({ fontId: fontBoldId, fillId: fillGroupId, borderId: borderThinId }),
+    text: makeXf({ borderId: borderThinId }),
+    num: makeXf({ borderId: borderThinId, numFmtId: numFmtId, align: 'right' }),
+    totalText: makeXf({ fontId: fontBoldId, fillId: fillTotalId, borderId: borderThinId }),
+    totalNum: makeXf({ fontId: fontBoldId, fillId: fillTotalId, borderId: borderThinId, numFmtId: numFmtId, align: 'right' }),
+  };
+
+  zip.file(path, serializer.serializeToString(doc));
+  return styleIds;
+}
+
+function buildPivotSheetXml(pivotRows, styleIds) {
+  const rows = [{
+    cells: ['列標籤', '加總 - 出货数量', '加總 - 出货金额'],
+    styles: [styleIds.header, styleIds.header, styleIds.header],
+  }];
+  pivotRows.forEach(function (r) {
+    let st;
+    if (r.kind === 'group') st = [styleIds.group, styleIds.group, styleIds.group];
+    else if (r.kind === 'total') st = [styleIds.totalText, styleIds.totalNum, styleIds.totalNum];
+    else st = [styleIds.text, styleIds.num, styleIds.num];
+    rows.push({ cells: [r.label, r.qty, r.amt], styles: st });
+  });
+
+  const rowsXml = rows.map(function (row, idx) {
     const rowNum = idx + 1;
-    const cellsXml = cells.map(function (val, colIdx) {
-      if (val === null || val === undefined || val === '') return '';
+    const cellsXml = row.cells.map(function (val, colIdx) {
       const ref = colLetter(colIdx + 1) + rowNum;
-      if (typeof val === 'number') return '<c r="' + ref + '"><v>' + val + '</v></c>';
-      return '<c r="' + ref + '" t="inlineStr"><is><t>' + escapeXml(val) + '</t></is></c>';
+      const s = row.styles[colIdx];
+      const sAttr = (s !== undefined && s !== null) ? (' s="' + s + '"') : '';
+      if (val === null || val === undefined || val === '') return '<c r="' + ref + '"' + sAttr + '/>';
+      if (typeof val === 'number') return '<c r="' + ref + '"' + sAttr + '><v>' + val + '</v></c>';
+      return '<c r="' + ref + '"' + sAttr + ' t="inlineStr"><is><t>' + escapeXml(val) + '</t></is></c>';
     }).join('');
     return '<row r="' + rowNum + '">' + cellsXml + '</row>';
   }).join('');
 
-  const lastRow = allRows.length;
+  const lastRow = rows.length;
   return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
     '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
     '<dimension ref="A1:C' + lastRow + '"/>' +
@@ -479,7 +611,8 @@ async function buildOutputBlob(file, pivotRows) {
     zip.file(ctPath, serializer.serializeToString(ctDoc));
   }
 
-  const sheetXml = buildPivotSheetXml(pivotRows);
+  const styleIds = await ensurePivotStyles(zip, parser, serializer);
+  const sheetXml = buildPivotSheetXml(pivotRows, styleIds);
   zip.file(targetSheetPath, sheetXml);
 
   return zip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
