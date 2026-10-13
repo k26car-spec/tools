@@ -395,6 +395,19 @@ function parseCellRef(ref) {
   return { col: col, row: parseInt(m[2], 10) };
 }
 
+// 依分頁名稱找出它在 zip 裡實際的 worksheet XML 路徑（例如 xl/worksheets/sheet2.xml）。
+function findSheetPath(wbDoc, relsDoc, ns, relNs, relsRootNs, sheetName) {
+  const sheetsEl = wbDoc.getElementsByTagNameNS(ns, 'sheets')[0];
+  const sheetEls = Array.prototype.slice.call(sheetsEl.getElementsByTagNameNS(ns, 'sheet'));
+  const sheetEl = sheetEls.filter(function (s) { return s.getAttribute('name') === sheetName; })[0];
+  if (!sheetEl) return null;
+  const rid = sheetEl.getAttributeNS(relNs, 'id');
+  const relEls = Array.prototype.slice.call(relsDoc.getElementsByTagNameNS(relsRootNs, 'Relationship'));
+  const relEl = relEls.filter(function (r) { return r.getAttribute('Id') === rid; })[0];
+  if (!relEl) return null;
+  return 'xl/' + relEl.getAttribute('Target').replace(/^\.?\//, '').replace(/^xl\//, '');
+}
+
 function isNumericRaw(v) {
   if (typeof v === 'number') return true;
   if (v && typeof v === 'object' && 'result' in v) return typeof v.result === 'number';
@@ -419,7 +432,7 @@ function buildSurvivingHeaders(headerByIndex) {
 // 這樣「工作表1」會是一張真正可以互動的樞紐表：列標籤旁有篩選下拉箭頭，
 // 可以勾選要顯示哪些客戶/單號、也可以展開收合，不是純文字的靜態表格。
 
-function buildPivotCacheParts(includedRows, survivingHeaders, sheetName, sourceRef, customerOrder, globalOrderList) {
+function buildPivotCacheParts(includedRows, survivingHeaders, sourceTableName, customerOrder, globalOrderList) {
   const customerIndex = new Map(customerOrder.map(function (c, i) { return [c, i]; }));
   const orderIndex = new Map(globalOrderList.map(function (o, i) { return [o, i]; }));
 
@@ -448,7 +461,7 @@ function buildPivotCacheParts(includedRows, survivingHeaders, sheetName, sourceR
 
   const cacheDefXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
     '<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1" refreshedBy="樞紐分析工具" refreshedDate="0" createdVersion="6" refreshedVersion="6" minRefreshableVersion="3" recordCount="' + includedRows.length + '">' +
-    '<cacheSource type="worksheet"><worksheetSource ref="' + sourceRef + '" sheet="' + escapeXml(sheetName) + '"/></cacheSource>' +
+    '<cacheSource type="worksheet"><worksheetSource name="' + escapeXml(sourceTableName) + '"/></cacheSource>' +
     '<cacheFields count="' + survivingHeaders.length + '">' + cacheFieldsXml + '</cacheFields>' +
     '</pivotCacheDefinition>';
 
@@ -505,16 +518,82 @@ function buildPivotTableDefXml(survivingHeaders, customerOrder, groups, globalOr
     '</pivotTableDefinition>';
 }
 
+// 在 Sheet1 上建一個正式的 Excel Table（結構化表格）物件，讓樞紐表的資料來源
+// 指到這個 Table（而不是裸的儲存格範圍）。Google 試算表從 2026-08 起，匯入
+// xlsx 時只有「樞紐表來源是 Excel Table」才會轉成真正可互動的樞紐表，來源是
+// 裸範圍的話一律會被攤平成純數值——這就是先前「工作表1 沒有樞紐表互動功能」
+// 的根本原因，跟 XML 寫得完不完整無關。
+async function addExcelTableToSheet1(zip, parser, serializer, relsRootNs, relNs, sheetPath, survivingHeaders, totalRowCount) {
+  const usedTableNums = [];
+  zip.forEach(function (p) { const m = p.match(/^xl\/tables\/table(\d+)\.xml$/); if (m) usedTableNums.push(parseInt(m[1], 10)); });
+  const tableId = (usedTableNums.length ? Math.max.apply(null, usedTableNums) : 0) + 1;
+  const tableName = '出貨明細表' + tableId;
+
+  const rangeRef = 'A1:' + colLetter(survivingHeaders.length) + totalRowCount;
+  const colsXml = survivingHeaders.map(function (name, i) {
+    return '<tableColumn id="' + (i + 1) + '" name="' + escapeXml(name) + '"/>';
+  }).join('');
+  const tableXml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+    '<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="' + tableId + '" name="' + escapeXml(tableName) + '" displayName="' + escapeXml(tableName) + '" ref="' + rangeRef + '" totalsRowShown="0">' +
+    '<autoFilter ref="' + rangeRef + '"/>' +
+    '<tableColumns count="' + survivingHeaders.length + '">' + colsXml + '</tableColumns>' +
+    '<tableStyleInfo name="TableStyleMedium2" showFirstColumn="0" showLastColumn="0" showRowStripes="1" showColumnStripes="0"/>' +
+    '</table>';
+
+  const tablePath = 'xl/tables/table' + tableId + '.xml';
+  zip.file(tablePath, tableXml);
+
+  const wsDir = sheetPath.substring(0, sheetPath.lastIndexOf('/'));
+  const wsFileName = sheetPath.substring(sheetPath.lastIndexOf('/') + 1);
+  const wsRelsPath = wsDir + '/_rels/' + wsFileName + '.rels';
+  const existingRelsFile = zip.file(wsRelsPath);
+  const wsRelsDoc = existingRelsFile
+    ? parser.parseFromString(await existingRelsFile.async('string'), 'application/xml')
+    : parser.parseFromString('<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="' + relsRootNs + '"/>', 'application/xml');
+
+  const existingRelEls = Array.prototype.slice.call(wsRelsDoc.getElementsByTagNameNS(relsRootNs, 'Relationship'));
+  const usedRids = existingRelEls.map(function (r) { return parseInt(r.getAttribute('Id').replace('rId', ''), 10); }).filter(function (n) { return !Number.isNaN(n); });
+  const tableRid = 'rId' + ((usedRids.length ? Math.max.apply(null, usedRids) : 0) + 1);
+  const tableRelEl = wsRelsDoc.createElementNS(relsRootNs, 'Relationship');
+  tableRelEl.setAttribute('Id', tableRid);
+  tableRelEl.setAttribute('Type', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/table');
+  tableRelEl.setAttribute('Target', '../tables/table' + tableId + '.xml');
+  wsRelsDoc.documentElement.appendChild(tableRelEl);
+  zip.file(wsRelsPath, serializer.serializeToString(wsRelsDoc));
+
+  const smlNs = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+  const wsDoc = parser.parseFromString(await zip.file(sheetPath).async('string'), 'application/xml');
+  const wsRoot = wsDoc.documentElement;
+  let tablePartsEl = wsRoot.getElementsByTagNameNS(smlNs, 'tableParts')[0];
+  if (!tablePartsEl) {
+    tablePartsEl = wsDoc.createElementNS(smlNs, 'tableParts');
+    tablePartsEl.setAttribute('count', '0');
+    const extLstEl = wsRoot.getElementsByTagNameNS(smlNs, 'extLst')[0];
+    if (extLstEl) wsRoot.insertBefore(tablePartsEl, extLstEl);
+    else wsRoot.appendChild(tablePartsEl);
+  }
+  const tablePartEl = wsDoc.createElementNS(smlNs, 'tablePart');
+  tablePartEl.setAttributeNS(relNs, 'r:id', tableRid);
+  tablePartsEl.appendChild(tablePartEl);
+  tablePartsEl.setAttribute('count', String(tablePartsEl.getElementsByTagNameNS(smlNs, 'tablePart').length));
+  zip.file(sheetPath, serializer.serializeToString(wsDoc));
+
+  return { tableName: tableName, tableId: tableId };
+}
+
 // 把一張原生樞紐表的所有部件（pivotCache定義+快取記錄+pivotTable版面）加進 zip，
 // 並且把 workbook.xml 的 <pivotCaches>、worksheet 自己的 _rels、[Content_Types].xml
 // 該補的宣告都補齊。cacheId/部件編號一律掃描既有檔案找出下一個可用的號碼，
 // 不會跟其他既有的樞紐表（如果原始檔案裡還有別的）衝突。
-async function addNativePivotTable(zip, ns, relNs, relsRootNs, ctNs, wbDoc, relsDoc, ctDoc, targetSheetPath, pivotRows, customerOrder, groups, headerByIndex, includedRows) {
+async function addNativePivotTable(zip, parser, serializer, ns, relNs, relsRootNs, ctNs, wbDoc, relsDoc, ctDoc, targetSheetPath, pivotRows, customerOrder, groups, headerByIndex, includedRows, totalSheet1Rows) {
   const survivingHeaders = buildSurvivingHeaders(headerByIndex);
   if (survivingHeaders.indexOf('客户') === -1 || survivingHeaders.indexOf('销售出货单号') === -1 ||
       survivingHeaders.indexOf('出货数量') === -1 || survivingHeaders.indexOf('出货金额') === -1) {
     return; // 保險：必要欄位不在了就不做原生樞紐表，純數值表格還是會照常輸出
   }
+  const sheet1Path = findSheetPath(wbDoc, relsDoc, ns, relNs, relsRootNs, 'Sheet1');
+  if (!sheet1Path) return;
+
   const globalOrderList = buildGlobalOrderList(includedRows);
 
   const usedCacheDefNums = [];
@@ -529,8 +608,9 @@ async function addNativePivotTable(zip, ns, relNs, relsRootNs, ctNs, wbDoc, rels
     .map(function (el) { return parseInt(el.getAttribute('cacheId'), 10); }).filter(function (n) { return !Number.isNaN(n); });
   const cacheId = (usedCacheIds.length ? Math.max.apply(null, usedCacheIds) : 0) + 1;
 
-  const sourceRef = 'A1:' + colLetter(survivingHeaders.length) + (includedRows.length + 1);
-  const { cacheDefXml, cacheRecordsXml } = buildPivotCacheParts(includedRows, survivingHeaders, 'Sheet1', sourceRef, customerOrder, globalOrderList);
+  const table = await addExcelTableToSheet1(zip, parser, serializer, relsRootNs, relNs, sheet1Path, survivingHeaders, totalSheet1Rows);
+
+  const { cacheDefXml, cacheRecordsXml } = buildPivotCacheParts(includedRows, survivingHeaders, table.tableName, customerOrder, globalOrderList);
 
   const locationRef = 'A1:C' + (pivotRows.length + 1);
   const pivotTableXml = buildPivotTableDefXml(survivingHeaders, customerOrder, groups, globalOrderList, locationRef, cacheId, '樞紐分析表' + cacheId);
@@ -581,6 +661,7 @@ async function addNativePivotTable(zip, ns, relNs, relsRootNs, ctNs, wbDoc, rels
   addOverride('/' + cacheDefPath, 'application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheDefinition+xml');
   addOverride('/' + cacheRecordsPath, 'application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheRecords+xml');
   addOverride('/' + ptPath, 'application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml');
+  addOverride('/xl/tables/table' + table.tableId + '.xml', 'application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml');
 }
 
 // 把 Sheet1 裡指定的欄位隱藏（保留資料，只是不顯示）或整欄刪掉（資料跟著消失，
@@ -588,10 +669,8 @@ async function addNativePivotTable(zip, ns, relNs, relsRootNs, ctNs, wbDoc, rels
 // 找出目標欄位實際在第幾欄，而不是寫死固定位置，這樣不管原始報表欄位順序/
 // 數量怎麼變化都抓得到；找不到的欄位名稱就跳過，不會報錯。
 async function hideAndDeleteColumns(zip, parser, serializer, ns, relNs, relsRootNs, wbDoc, relsDoc, headerByIndex) {
-  const sheetsEl = wbDoc.getElementsByTagNameNS(ns, 'sheets')[0];
-  const sheetEls = Array.prototype.slice.call(sheetsEl.getElementsByTagNameNS(ns, 'sheet'));
-  const sheet1El = sheetEls.filter(function (s) { return s.getAttribute('name') === 'Sheet1'; })[0];
-  if (!sheet1El) return { hiddenCount: 0, deletedCount: 0 };
+  const wsPath = findSheetPath(wbDoc, relsDoc, ns, relNs, relsRootNs, 'Sheet1');
+  if (!wsPath) return { hiddenCount: 0, deletedCount: 0 };
 
   const hideSet = {};
   HIDE_COLS.forEach(function (name) {
@@ -606,11 +685,6 @@ async function hideAndDeleteColumns(zip, parser, serializer, ns, relNs, relsRoot
   const hiddenCount = Object.keys(hideSet).length;
   const deletedCount = Object.keys(deleteSet).length;
   if (!hiddenCount && !deletedCount) return { hiddenCount: 0, deletedCount: 0 };
-
-  const rid = sheet1El.getAttributeNS(relNs, 'id');
-  const relEls = Array.prototype.slice.call(relsDoc.getElementsByTagNameNS(relsRootNs, 'Relationship'));
-  const relEl = relEls.filter(function (r) { return r.getAttribute('Id') === rid; })[0];
-  const wsPath = 'xl/' + relEl.getAttribute('Target').replace(/^\.?\//, '').replace(/^xl\//, '');
 
   const maxCol = headerByIndex.length - 1;
   const remap = {};
@@ -996,7 +1070,7 @@ async function removeExistingSheetFully(zip, parser, serializer, ns, relNs, rels
   }
 }
 
-async function buildOutputBlob(file, pivotRows, headerByIndex, customerOrder, groups, includedRows) {
+async function buildOutputBlob(file, pivotRows, headerByIndex, customerOrder, groups, includedRows, totalSheet1Rows) {
   const originalBuffer = await file.arrayBuffer();
   const zip = await JSZip.loadAsync(originalBuffer);
   const parser = new DOMParser();
@@ -1062,7 +1136,7 @@ async function buildOutputBlob(file, pivotRows, headerByIndex, customerOrder, gr
 
   let pivotTableOk = true;
   try {
-    await addNativePivotTable(zip, ns, relNs, relsRootNs, ctNs, wbDoc, relsDoc, ctDoc, targetSheetPath, pivotRows, customerOrder, groups, headerByIndex, includedRows);
+    await addNativePivotTable(zip, parser, serializer, ns, relNs, relsRootNs, ctNs, wbDoc, relsDoc, ctDoc, targetSheetPath, pivotRows, customerOrder, groups, headerByIndex, includedRows, totalSheet1Rows);
   } catch (e) {
     pivotTableOk = false;
     console.error('原生樞紐表建立失敗，改用純數值表格：', e);
@@ -1102,7 +1176,7 @@ async function run() {
     const totalRow = pivotRows[pivotRows.length - 1];
     const includedRows = rows.filter(function (r) { return !!toStr(r['客户']); });
 
-    const { blob, colChanges, pivotTableOk } = await buildOutputBlob(file, pivotRows, headerByIndex, customerOrder, groups, includedRows);
+    const { blob, colChanges, pivotTableOk } = await buildOutputBlob(file, pivotRows, headerByIndex, customerOrder, groups, includedRows, rows.length + 1);
 
     let msg = '分析完成，共 ' + rows.length + ' 筆明細';
     if (skippedTotalRows) {
